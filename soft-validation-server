@@ -1,0 +1,355 @@
+#! /usr/bin/python
+#
+# Copyright (c) 2011, 2012 Yubico AB
+# Copyright (c) 2018 StoredSafe AB
+# See the file COPYING for licence statement.
+#
+"""
+This is a HOTP/TOTP validation server with a SQLLite3 database
+Its based on yubicos yhsm validation server however this is meant to be
+run without any HSM, yet providing similar behaviour and functionallity
+"""
+import re
+import sqlite3
+import argparse
+import sys
+import os
+import BaseHTTPServer
+import urlparse
+import syslog
+import socket
+import datetime
+import time
+import pyotp
+import base64
+
+default_db_file = "/var/oath/oath.db"
+default_hotp_window = 5
+default_totp_interval = 30
+default_totp_tolerance = 1
+default_serve_url = "/oath/validate?"
+
+hotp_valid_input = re.compile('^[cbdefghijklnrtuv0-9]{6,20}$')
+totp_valid_input = re.compile('^[cbdefghijklnrtuv0-9]{6,20}$')
+
+args = None
+
+class ValOathDb():
+    """ Provides access to database with information for OATH tokens. """
+    def __init__(self, filename):
+        self.filename = filename
+        self.conn = sqlite3.connect(self.filename)
+        self.conn.row_factory = sqlite3.Row
+
+    def get(self, key):
+        """ Fetch entry from database. """
+        c = self.conn.cursor()
+        for row in c.execute("SELECT key, secret, oath_C, oath_T FROM oath WHERE key = ?", (key,)):
+            return ValOathEntry(row)
+        raise Exception("OATH token for '%s' not found in database (%s)" % (key, self.filename))
+
+    def update_oath_hotp_c(self, entry, new_c):
+        """
+        Update the OATH-HOTP counter value for `entry' in the database.
+        Use SQL statement to ensure we only ever increase the counter.
+        """
+        key = entry.data["key"]
+        c = self.conn.cursor()
+        c.execute("UPDATE oath SET oath_c = ? WHERE key = ? AND ? > oath_c",
+                  (new_c, key, new_c,))
+        self.conn.commit()
+        return c.rowcount == 1
+
+class ValOathEntry():
+    """ Class to hold a row of ValOathDb. """
+    def __init__(self, row):
+        if row:
+            self.data = row
+
+def parse_args():
+    """
+    Parse the command line arguments
+    """
+    parser = argparse.ArgumentParser(description="Validate OATH secrets",
+                                     add_help=True,
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter,)
+    parser.add_argument('--debug',
+                        dest='debug',
+                        action='store_true', default=False,
+                        help='Enable debug operation',)
+    parser.add_argument('--hotp',
+                        dest='mode_hotp',
+                        action='store_true', default=False,
+                        help='Enable OATH-HOTP validation',)
+    parser.add_argument('--totp',
+                        dest='mode_totp',
+                        action='store_true', default=False,
+                        help='Enable OATH-TOTP validation',)
+    parser.add_argument('--db-file',
+                        dest='db_file',
+                        default=default_db_file,
+                        required=False,
+                        help='DB file for storing oath secrets for --totp and --hotp',
+                        metavar='FILENAME',)
+    parser.add_argument('--port',
+                        dest='listen_port',
+                        type=int, default=8003,
+                        required=False,
+                        help='Port to listen on',
+                        metavar='PORT',)
+    parser.add_argument('-v', '--verbose',
+                        dest='verbose',
+                        action='store_true', default=False,
+                        help='Enable verbose operation',)
+    parser.add_argument('--addr',
+                        dest='listen_addr',
+                        default="127.0.0.1",
+                        required=False,
+                        help='Address to bind to',
+                        metavar='ADDR',)
+    parser.add_argument('--hotp-window',
+                        dest='look_ahead',
+                        type=int, required=False,
+                        default=default_hotp_window,
+                        help='Number of OATH-HOTP codes to search',
+                        metavar='NUM',)
+    parser.add_argument('--totp-interval',
+                        dest='interval',
+                        type=int, required=False,
+                        default=default_totp_interval,
+                        help='Timeframe in seconds for a valid OATH-TOTP code',
+                        metavar='NUM',)
+    parser.add_argument('-U', '--serve-url',
+                        dest='serve_url',
+                        default=default_serve_url,
+                        required=False,
+                        help='Base URL for validation web service',)
+    parser.add_argument('--totp-tolerance',
+                        dest='tolerance',
+                        type=int, required=False,
+                        default=default_totp_tolerance,
+                        help='Tolerance in time-steps for a valid OATH-TOTP code',
+                        metavar='NUM',)
+    return parser.parse_args()
+
+class OATH_Server(BaseHTTPServer.HTTPServer):
+    """
+    Wrapper class to properly initialize address_family for IPv6 addresses.
+    """
+    def __init__(self, server_address, req_handler):
+        if ":" in server_address[0]:
+            self.address_family = socket.AF_INET6
+        BaseHTTPServer.HTTPServer.__init__(self, server_address, req_handler)
+
+class OATH_VALRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    """
+    Handle HTTP GET requests according to configuration in global variable `args'.
+    """
+
+    def do_GET(self):
+        """
+        Process validation GET requests.
+
+        All modes of validation must be explicitly
+        enabled in `args' to be allowed.
+        """
+        if self.path.startswith(args.serve_url):
+            res = None
+            log_res = None
+            mode = None
+            params = urlparse.parse_qs(self.path[len(args.serve_url):])
+            if "hotp" in params:
+                if args.mode_hotp:
+                    mode = 'OATH-HOTP'
+                    res = validate_oath_hotp(self, params)
+                else:
+                    res = "ERR 'hotp' disabled"
+            elif "totp" in params:
+                if args.mode_totp:
+                    mode = 'OATH-TOTP'
+                    res = validate_oath_totp(self, params)
+                else:
+                    res = "ERR 'totp' disabled"
+
+            if not log_res:
+                log_res = res
+
+            self.log_message("%s validation result: %s -> %s", mode, self.path, log_res)
+
+            if res != None:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(res)
+                self.wfile.write("\n")
+            else:
+                self.log_error("No validation result to '%s' (responding 403)" % (self.path))
+                self.send_response(403, 'Forbidden')
+                self.end_headers()
+        else:
+            self.log_error("Bad URL '%s' - I'm serving '%s' (responding 403)" % (self.path, args.serve_url))
+            self.send_response(403, 'Forbidden')
+            self.end_headers()
+
+    def log_error(self, fmt, *fmt_args):
+        """ Log to syslog. """
+        msg = self.my_address_string() + " - - " + fmt % fmt_args
+        my_log_message(args, syslog.LOG_ERR, msg)
+
+    def log_message(self, fmt, *fmt_args):
+        """ Log to syslog. """
+        msg = self.my_address_string() + " - - " + fmt % fmt_args
+        my_log_message(args, syslog.LOG_INFO, msg)
+
+    def my_address_string(self):
+        """ For logging client host without resolving. """
+        return self.client_address[0]
+
+def my_log_message(my_args, prio, msg):
+    """
+    Log msg to syslog, and possibly also output to stderr.
+    """
+    syslog.syslog(prio, msg)
+    if my_args.debug or my_args.verbose or prio == syslog.LOG_ERR:
+        sys.stderr.write("%s\n" % (msg))
+
+def validate_oath_hotp(self, params):
+    """
+    Validate OATH-HOTP that we have stored in an SQLite3 database.
+    """
+    from_key = params["hotp"][0]
+    if not re.match(totp_valid_input, from_key):
+        self.log_error("IN: %s, Invalid OATH-HOTP OTP" % (params))
+        return "ERR Invalid OATH-HOTP OTP"
+    uid, otp, = get_oath_hotp_bits(params)
+    if not uid or not otp:
+        self.log_error("IN: %s, could not get UID/OTP ('%s'/'%s')" % (params, uid, otp))
+        return "ERR Invalid OATH-HOTP input"
+    if args.debug:
+        print "OATH-HOTP uid %s, OTP %s" % (uid, otp)
+
+    try:
+        db = ValOathDb(args.db_file)
+        entry = db.get(uid)
+    except Exception, e:
+        self.log_error("IN: %s, database error : '%s'" % (params, e))
+        return "ERR Internal error"
+    tryme = base64.b32encode(entry.data["secret"].decode("hex"))
+    counter = int(entry.data["oath_C"])
+    fail = 'yes'
+    hotp = pyotp.HOTP(tryme)
+    for x in range(counter, args.look_ahead + counter):
+        if hotp.verify(otp, x):
+            counter = x
+            fail = 0
+            break
+
+    if args.debug:
+        print "OATH-HOTP counter: %i, look_ahead: %i -> new counter == %s" \
+             % (entry.data["oath_c"], args.look_ahead, counter)
+    if type(fail) != int:
+        return "ERR Could not validate OATH-HOTP OTP"
+    try:
+        if db.update_oath_hotp_c(entry, counter):
+            return "OK counter=%04x" % (counter)
+        else:
+            return "ERR replayed OATH-HOTP"
+    except Exception, e:
+        self.log_error("IN: %s, database error updating counter : %s" % (params, e))
+        return "ERR Internal error"
+
+def validate_oath_totp(self, params):
+    """
+    Validate OATH-TOTP that we have stored in an SQLite3 database.
+    """
+    from_key = params["totp"][0]
+    if not re.match(totp_valid_input, from_key):
+        self.log_error("IN: %s, Invalid OATH-TOTP OTP" % (params))
+        return "ERR Invalid OATH-TOTP OTP"
+    uid, otp, = get_oath_totp_bits(params)
+    if not uid or not otp:
+        self.log_error("IN: %s, could not get UID/OTP ('%s'/'%s')" % (params, uid, otp))
+        return "ERR Invalid OATH-TOTP input"
+    if args.debug:
+        print "OATH-TOTP uid %s, OTP %s" % (uid, otp)
+
+    try:
+        db = ValOathDb(args.db_file)
+        entry = db.get(uid)
+    except Exception, e:
+        self.log_error("IN: %s, database error : '%s'" % (params, e))
+        return "ERR Internal error"
+    tryme = base64.b32encode(entry.data["secret"].decode("hex"))
+    new_timecounter = 'foobar'
+    totp = pyotp.TOTP(tryme)
+    if (totp.verify(otp, valid_window=args.tolerance)):
+        new_timecounter = timecode(datetime.datetime.now(), args.interval) - args.tolerance
+    else:
+        new_timecounter = 'invalid'
+
+    if args.debug:
+        print "OATH-TOTP counter: %i, interval: %i -> new timecounter == %s" \
+             % (entry.data["oath_c"], args.interval, new_timecounter)
+    if type(new_timecounter) != int:
+        return "ERR Could not validate OATH-TOTP OTP"
+    try:
+        if db.update_oath_hotp_c(entry, new_timecounter):
+            return "OK timecounter=%04x" % (new_timecounter)
+        else:
+            return "ERR replayed OATH-TOTP"
+    except Exception, e:
+        self.log_error("IN: %s, database error updating counter : %s" % (params, e))
+        return "ERR Internal error"
+
+def timecode(time_now, interval):
+    """ make integer and divide by time interval of valid OTP """
+    time_counter = time.mktime(time_now.timetuple())
+    return int(time_counter / interval)
+
+def get_oath_totp_bits(params):
+    """ Extract the OATH-TOTP uid and OTP from params. """
+    if "uid" in params:
+        return params["uid"][0], int(params["totp"][0])
+    m = re.match("^([cbdefghijklnrtuv]*)([0-9]{6,8})", params["totp"][0])
+    uid, otp, = m.groups()
+    return uid, otp,
+
+def get_oath_hotp_bits(params):
+    """ Extract the OATH-TOTP uid and OTP from params. """
+    if "uid" in params:
+        return params["uid"][0], int(params["hotp"][0])
+    m = re.match("^([cbdefghijklnrtuv]*)([0-9]{6,8})", params["hotp"][0])
+    uid, otp, = m.groups()
+    return uid, otp,
+
+def run():
+    """
+    Start the BaseHTTPServer
+    """
+    server_address = (args.listen_addr, args.listen_port)
+    httpd = OATH_Server(server_address, OATH_VALRequestHandler)
+    my_log_message(args, syslog.LOG_INFO, "Serving requests to 'http://%s:%s%s'" \
+                       % (args.listen_addr, args.listen_port, args.serve_url))
+    httpd.serve_forever()
+
+def main():
+    """
+    The main function that will be executed when running this as a stand alone script.
+    """
+    my_name = os.path.basename(sys.argv[0])
+    if not my_name:
+        my_name = "soft-validation-server"
+
+    global args
+    args = parse_args()
+
+    try:
+        run()
+    except KeyboardInterrupt:
+        print ""
+        print "Shutting down"
+        print ""
+
+
+if __name__ == '__main__':
+    sys.exit(main())
