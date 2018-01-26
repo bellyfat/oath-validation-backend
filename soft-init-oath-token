@@ -22,7 +22,7 @@ def parse_args():
     Parse the command line arguments
     """
 
-    parser = argparse.ArgumentParser(description='Initialize OATH token for use with yhsm-validation-server',
+    parser = argparse.ArgumentParser(description='Initialize OATH token for use with soft-validation-server',
                                      add_help=True,
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter,)
     parser.add_argument('-v', '--verbose',
