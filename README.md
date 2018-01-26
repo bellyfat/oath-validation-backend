@@ -37,3 +37,6 @@ usage:
 
 soft-init-oath-token [-h] [-v] [--debug] [--force] --uid STR
                             [--oath-c INT] [--oath-k HEXSTR] [--db-file FN]
+                            
+                            
+This is more or less standard oath, using 6 digit OTPs with customizable look ahead, tolerance etc.. works with for instance Google Authenticator.
