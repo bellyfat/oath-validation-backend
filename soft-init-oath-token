@@ -148,9 +148,7 @@ def read_secret(args):
 def main():
     args = parse_args()
 
-    #nonce = 'nounce_a'
     secret = read_secret(args)
-    #oath_c = validate_oath_c(hsm, args, nonce, aead)
     return store_oath_entry(args, secret, args.oath_c)
 
 if __name__ == '__main__':
