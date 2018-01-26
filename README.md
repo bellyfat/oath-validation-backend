@@ -4,7 +4,7 @@ Oath validation server for HOTP and/or TOTP using sqlite3 as backend
 This is a small server for validating oath, hotp (counter based) and totp (time based) one-time passwords (OTP). 
 
 The idea is to mimic how pyhsm from Yubico does the OATH validation with their YubiHSM but without the actuall HSM.
-Why? Because I needed to test the functionallity without the cost of a HSM. This is also why Yubicos copywrite is in the
+Why? Because I needed to test the functionallity without the cost of a HSM. This is also why Yubicos copyright is in the
 files, please respect that. 
 
 With that said keep in mind that the "secret" of the OATH is stored in cleartext in the sqlite database. 
