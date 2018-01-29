@@ -1,0 +1,53 @@
+First as an example we need a OATH client, this is just a simple one in pyotp
+
+>>> import pyotp
+>>> totp = pyotp.TOTP('ORQW64L2NJVGY2DXNZZHO33KOJVW42DN')
+>>> counter = totp.now()
+>>> print counter
+818884
+
+Alternativly we want to use Google Authenticator, either manually enter the above secret into the GA or create the
+provisioning string which we will qrcode encode to scan it into GA.
+
+>>> pyotp.totp.TOTP('ORQW64L2NJVGY2DXNZZHO33KOJVW42DN').provisioning_uri("test@mactestface.face", issuer_name="test test")
+u'otpauth://totp/test%20test:test%40mactestface.face?secret=ORQW64L2NJVGY2DXNZZHO33KOJVW42DN&issuer=test%20test'
+
+qrencode -o burn-after-reading.png "otpauth://totp/test%20test:test%40mactestface.face?secret=ORQW64L2NJVGY2DXNZZHO33KOJVW42DN&issuer=test%20test"
+
+then we have to "invent" a user id, this is so we know which secret to use for a specific user. And initialize the token.
+in this case i used "cccccccccccd" ( I have keept the yubikey encoding for the uids so valid chars are cbdefghijklnrtuv)
+
+# soft-init-oath-token --oath-k 74616f717a6a6a6c68776e72776f6a726b6e686d --uid cccccccccccd
+
+
+Then we start the server, in this case with mostly default values:
+
+# /usr/sbin/soft-validation-server --totp --debug
+Serving requests to 'http://127.0.0.1:8003/oath/validate?'
+
+Send the request to the server via wget or something similar(the url + uid + otp:
+
+# wget -qO- http://127.0.0.1:8003/oath/validate?totp=cccccccccccd818884
+
+OK timecounter=303b273
+
+Serverside:
+
+OATH-TOTP uid cccccccccccd, OTP 818884
+OATH-TOTP counter: 0, interval: 30 -> new timecounter == 50573939
+127.0.0.1 - - OATH-TOTP validation result: /oath/validate?totp=cccccccccccd818884 -> OK timecounter=303b273
+127.0.0.1 - - "GET /oath/validate?totp=cccccccccccd818884 HTTP/1.1" 200 -
+
+If we do the same again we should get a replay:
+
+OATH-TOTP uid cccccccccccd, OTP 818884
+OATH-TOTP counter: 50573939, interval: 30 -> new timecounter == 50573939
+127.0.0.1 - - OATH-TOTP validation result: /oath/validate?totp=cccccccccccd818884 -> ERR replayed OATH-TOTP
+127.0.0.1 - - "GET /oath/validate?totp=cccccccccccd818884 HTTP/1.1" 200 -
+
+Or just an invalid OTP:
+
+OATH-TOTP uid cccccccccccd, OTP 818885
+OATH-TOTP counter: 50573940, interval: 30 -> new timecounter == invalid
+127.0.0.1 - - OATH-TOTP validation result: /oath/validate?totp=cccccccccccd818885 -> ERR Could not validate OATH-TOTP OTP
+127.0.0.1 - - "GET /oath/validate?totp=cccccccccccd818885 HTTP/1.1" 200 -
