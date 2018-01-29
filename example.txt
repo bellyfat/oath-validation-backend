@@ -1,4 +1,5 @@
 First as an example we need a OATH client, this is just a simple one in pyotp
+(randomly generated 20 char base32 encoded secret)
 
 >>> import pyotp
 >>> totp = pyotp.TOTP('ORQW64L2NJVGY2DXNZZHO33KOJVW42DN')
@@ -15,7 +16,7 @@ u'otpauth://totp/test%20test:test%40mactestface.face?secret=ORQW64L2NJVGY2DXNZZH
 qrencode -o burn-after-reading.png "otpauth://totp/test%20test:test%40mactestface.face?secret=ORQW64L2NJVGY2DXNZZHO33KOJVW42DN&issuer=test%20test"
 
 then we have to "invent" a user id, this is so we know which secret to use for a specific user. And initialize the token.
-in this case i used "cccccccccccd" ( I have keept the yubikey encoding for the uids so valid chars are cbdefghijklnrtuv)
+in this case i used "cccccccccccd" ( I have keept the yubikey encoding for the uids so valid chars are cbdefghijklnrtuvi, same secret as above but in hex)
 
 # soft-init-oath-token --oath-k 74616f717a6a6a6c68776e72776f6a726b6e686d --uid cccccccccccd
 
@@ -25,10 +26,9 @@ Then we start the server, in this case with mostly default values:
 # /usr/sbin/soft-validation-server --totp --debug
 Serving requests to 'http://127.0.0.1:8003/oath/validate?'
 
-Send the request to the server via wget or something similar(the url + uid + otp:
+Send the request to the server via wget or something similar(the url + uid + otp):
 
 # wget -qO- http://127.0.0.1:8003/oath/validate?totp=cccccccccccd818884
-
 OK timecounter=303b273
 
 Serverside:
